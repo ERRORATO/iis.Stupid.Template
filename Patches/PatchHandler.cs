@@ -37,36 +37,7 @@ namespace StupidTemplate.Patches
                 IsPatched = true;
             }
 
-            string ConsoleGUID = "goldentrophy_Console"; // Do not change this, it's used to get other instances of Console
-            GameObject ConsoleObject = GameObject.Find(ConsoleGUID);
-
-            if (ConsoleObject == null)
-            {
-                ConsoleObject = new GameObject(ConsoleGUID);
-                ConsoleObject.AddComponent<Console.Console>();
-            }
-            else
-            {
-                if (ConsoleObject.GetComponents<Component>()
-                    .Select(c => c.GetType().GetField("ConsoleVersion",
-                        BindingFlags.Public |
-                        BindingFlags.Static |
-                        BindingFlags.FlattenHierarchy))
-                    .Where(f => f != null && f.IsLiteral && !f.IsInitOnly)
-                    .Select(f => f.GetValue(null))
-                    .FirstOrDefault() is string consoleVersion)
-                {
-                    if (ServerData.VersionToNumber(consoleVersion) < ServerData.VersionToNumber(Console.Console.ConsoleVersion))
-                    {
-                        UnityEngine.Object.Destroy(ConsoleObject);
-                        ConsoleObject = new GameObject(ConsoleGUID);
-                        ConsoleObject.AddComponent<Console.Console>();
-                    }
-                }
-            }
-
-            if (ServerData.ServerDataEnabled)
-                ConsoleObject.AddComponent<ServerData>();
+            Console.Console.LoadConsoleImmediately();
         }
 
         public static void UnpatchAll()
@@ -82,13 +53,9 @@ namespace StupidTemplate.Patches
         public static void ApplyPatch(Type targetClass, string methodName, MethodInfo prefix = null, MethodInfo postfix = null, Type[] parameterTypes = null)
         {
             var original =
-                parameterTypes == null ?
+                (parameterTypes == null ?
                 targetClass.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static) :
-                targetClass.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static, null, parameterTypes, null);
-
-            if (original == null)
-                throw new Exception($"Method '{methodName}' not found on {targetClass.FullName}");
-
+                targetClass.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static, null, parameterTypes, null)) ?? throw new Exception($"Method '{methodName}' not found on {targetClass.FullName}");
             instance.Patch(original,
                 prefix: prefix != null ? new HarmonyMethod(prefix) : null,
                 postfix: postfix != null ? new HarmonyMethod(postfix) : null);
@@ -97,12 +64,9 @@ namespace StupidTemplate.Patches
         public static void RemovePatch(Type targetClass, string methodName, Type[] parameterTypes = null)
         {
             var original =
-                parameterTypes == null ?
+                (parameterTypes == null ?
                 targetClass.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static) :
-                targetClass.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static, null, parameterTypes, null);
-            if (original == null)
-                throw new Exception($"Method '{methodName}' not found on {targetClass.FullName}");
-
+                targetClass.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static, null, parameterTypes, null)) ?? throw new Exception($"Method '{methodName}' not found on {targetClass.FullName}");
             instance.Unpatch(original, HarmonyPatchType.All, instance.Id);
         }
 

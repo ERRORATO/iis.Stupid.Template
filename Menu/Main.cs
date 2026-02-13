@@ -76,6 +76,29 @@ namespace StupidTemplate.Menu
                     Debug.LogError(string.Format("{0} // Error initializing at {1}: {2}", PluginInfo.Name, exc.StackTrace, exc.Message));
                 }
 
+            // Cleanup Gun
+                try
+                {
+                    if (GunPointer != null)
+                    {
+                        if (!GunPointer.activeSelf)
+                            Destroy(GunPointer);
+                        else
+                            GunPointer.SetActive(false);
+                    }
+
+                    if (GunLine != null)
+                    {
+                        if (!GunLine.gameObject.activeSelf)
+                        {
+                            Destroy(GunLine.gameObject);
+                            GunLine = null;
+                        }
+                        else
+                            GunLine.gameObject.SetActive(false);
+                    }
+                } catch { }
+
             // Constant
                 try
                 {

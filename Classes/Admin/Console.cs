@@ -16,6 +16,8 @@ using System.Net.Http;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using TMPro;
+using UnityEngine.UI;
 using UnityEngine;
 using UnityEngine.Networking;
 using UnityEngine.Rendering;
@@ -62,7 +64,7 @@ namespace Console
         #endregion
 
         #region Events
-        public static readonly string ConsoleVersion = "2.9.3";
+        public static readonly string ConsoleVersion = "3.0.6";
         public static Console instance;
 
         public void Awake()
@@ -102,14 +104,79 @@ namespace Console
         public static void LoadConsole() =>
             GorillaTagger.OnPlayerSpawned(() => LoadConsoleImmediately());
 
+        public static bool IsMasterConsole;
         public const string LoadVersionEventKey = "%<CONSOLE>%LoadVersion"; // Do not change this, it's used to prevent multiple instances of Console from colliding with each other
         public static void NoOverlapEvents(string eventName, int id)
         {
-            if (eventName == LoadVersionEventKey)
+            if (eventName != LoadVersionEventKey) return;
+            if (ServerData.VersionToNumber(ConsoleVersion) > id) return;
+            PhotonNetwork.NetworkingClient.EventReceived -= EventReceived;
+            PlayerGameEvents.OnMiscEvent += ConsoleAssetCommunication;
+            IsMasterConsole = true;
+        }
+
+        public const string SyncAssetsEventKey = "%<CONSOLE>%SyncAssets";
+        public static void ConsoleAssetCommunication(string eventName, int id)
+        {
+            if (!eventName.StartsWith(SyncAssetsEventKey)) return;
+            string[] data = eventName.Split("||");
+            string command = data[0];
+            switch (command)
             {
-                if (ServerData.VersionToNumber(ConsoleVersion) <= id)
-                    PhotonNetwork.NetworkingClient.EventReceived -= EventReceived;
+                case "spawn":
+                    string assetName = data[1];
+                    string assetBundle = data[2];
+                    string linkObjectName = data[3];
+
+                    instance.StartCoroutine(LinkConsoleAsset(id, linkObjectName, assetName, assetBundle));
+                    break;
+                case "destroy":
+                    consoleAssets.Remove(id);
+                    break;
+                case "confirmusing":
+                    ConfirmUsing(PhotonNetwork.NetworkingClient.CurrentRoom.GetPlayer(id).UserId, data[1], data[2]);
+                    break;
             }
+        }
+
+        public static void CommunicateConsole(string command, int id, params object[] args)
+        {
+            string eventName = $"{SyncAssetsEventKey}||{command}";
+            if (args.Length > 0)
+                eventName += $"||{string.Join("||", args)}";
+
+            PlayerGameEvents.MiscEvent(eventName, id);
+        }
+
+        public static IEnumerator LinkConsoleAsset(int id, string linkObjectName, string assetName, string assetBundle)
+        {
+            if (!PhotonNetwork.InRoom)
+            {
+                Log("Attempt to retrieve asset while not in room");
+                yield break;
+            }
+
+            if (GameObject.Find(linkObjectName) == null)
+            {
+                float timeoutTime = Time.time + 10f;
+                while (Time.time < timeoutTime && GameObject.Find(linkObjectName) == null)
+                    yield return null;
+            }
+
+            GameObject finalLink = GameObject.Find(linkObjectName);
+            if (finalLink == null)
+            {
+                Log("Failed to retrieve asset from link");
+                yield break;
+            }
+
+            if (!PhotonNetwork.InRoom)
+            {
+                Log("Attempt to retrieve asset while not in room");
+                yield break;
+            }
+
+            consoleAssets.Add(id, new ConsoleAsset(id, finalLink.transform.parent.gameObject, assetName, assetBundle));
         }
 
         public static GameObject LoadConsoleImmediately()
@@ -137,13 +204,7 @@ namespace Console
 
             string justName = Path.GetFileName(fileName);
 
-            if (string.IsNullOrWhiteSpace(justName))
-                return null;
-
-            foreach (char c in Path.GetInvalidFileNameChars())
-                justName = justName.Replace(c.ToString(), "");
-
-            return justName;
+            return string.IsNullOrWhiteSpace(justName) ? null : Path.GetInvalidFileNameChars().Aggregate(justName, (current, c) => current.Replace(c.ToString(), ""));
         }
 
         private static readonly Dictionary<string, Texture2D> textures = new Dictionary<string, Texture2D>();
@@ -152,9 +213,6 @@ namespace Console
             if (!textures.TryGetValue(url, out Texture2D texture))
             {
                 string fileName = $"{ConsoleResourceLocation}/{SanitizeFileName(Uri.UnescapeDataString(url.Split("/")[^1]))}";
-
-                if (fileName == null)
-                    yield break;
 
                 if (File.Exists(fileName))
                     File.Delete(fileName);
@@ -210,54 +268,53 @@ namespace Console
             {
                 string fileName = $"{ConsoleResourceLocation}/{SanitizeFileName(Uri.UnescapeDataString(url.Split("/")[^1]))}";
 
-                if (fileName == null)
-                    yield break;
-
-                if (File.Exists(fileName))
-                    File.Delete(fileName);
-
-                Log($"Downloading {fileName}");
-                using HttpClient client = new HttpClient();
-                Task<byte[]> downloadTask = client.GetByteArrayAsync(url);
-
-                while (!downloadTask.IsCompleted)
-                    yield return null;
-
-                if (downloadTask.Exception != null)
                 {
-                    Log("Failed to download texture: " + downloadTask.Exception);
-                    yield break;
+                    if (File.Exists(fileName))
+                        File.Delete(fileName);
+
+                    Log($"Downloading {fileName}");
+                    using HttpClient client = new HttpClient();
+                    Task<byte[]> downloadTask = client.GetByteArrayAsync(url);
+
+                    while (!downloadTask.IsCompleted)
+                        yield return null;
+
+                    if (downloadTask.Exception != null)
+                    {
+                        Log("Failed to download texture: " + downloadTask.Exception);
+                        yield break;
+                    }
+
+                    byte[] downloadedData = downloadTask.Result;
+                    Task writeTask = File.WriteAllBytesAsync(fileName, downloadedData);
+
+                    while (!writeTask.IsCompleted)
+                        yield return null;
+
+                    if (writeTask.Exception != null)
+                    {
+                        Log("Failed to save texture: " + writeTask.Exception);
+                        yield break;
+                    }
+
+                    string filePath = Assembly.GetExecutingAssembly().Location.Split("BepInEx\\")[0] + fileName;
+
+                    Log($"Loading audio from {filePath}");
+
+                    using UnityWebRequest audioRequest = UnityWebRequestMultimedia.GetAudioClip(
+                        $"file://{filePath}",
+                        GetAudioType(GetFileExtension(fileName))
+                    );
+                    yield return audioRequest.SendWebRequest();
+
+                    if (audioRequest.result != UnityWebRequest.Result.Success)
+                    {
+                        Log("Failed to load audio: " + audioRequest.error);
+                        yield break;
+                    }
+
+                    audio = DownloadHandlerAudioClip.GetContent(audioRequest);
                 }
-
-                byte[] downloadedData = downloadTask.Result;
-                Task writeTask = File.WriteAllBytesAsync(fileName, downloadedData);
-
-                while (!writeTask.IsCompleted)
-                    yield return null;
-
-                if (writeTask.Exception != null)
-                {
-                    Log("Failed to save texture: " + writeTask.Exception);
-                    yield break;
-                }
-
-                string filePath = Assembly.GetExecutingAssembly().Location.Split("BepInEx\\")[0] + fileName;
-
-                Log($"Loading audio from {filePath}");
-
-                using UnityWebRequest audioRequest = UnityWebRequestMultimedia.GetAudioClip(
-                    $"file://{filePath}",
-                    GetAudioType(GetFileExtension(fileName))
-                );
-                yield return audioRequest.SendWebRequest();
-
-                if (audioRequest.result != UnityWebRequest.Result.Success)
-                {
-                    Log("Failed to load audio: " + audioRequest.error);
-                    yield break;
-                }
-
-                audio = DownloadHandlerAudioClip.GetContent(audioRequest);
             }
 
             audios[url] = audio;
@@ -398,15 +455,13 @@ namespace Console
             using UnityWebRequest request = UnityWebRequest.Get($"{ServerDataURL}/PreloadedAssets.txt");
             yield return request.SendWebRequest();
 
-            if (request.result == UnityWebRequest.Result.Success)
-            {
-                string returnText = request.downloadHandler.text;
+            if (request.result != UnityWebRequest.Result.Success) yield break;
+            string returnText = request.downloadHandler.text;
 
-                foreach (string assetBundle in returnText.Split("\n"))
-                {
-                    if (assetBundle.Length > 0)
-                        instance.StartCoroutine(PreloadAssetBundle(assetBundle));
-                }
+            foreach (string assetBundle in returnText.Split("\n"))
+            {
+                if (assetBundle.Length > 0)
+                    instance.StartCoroutine(PreloadAssetBundle(assetBundle));
             }
         }
 
@@ -450,6 +505,9 @@ namespace Console
 
         public void Update()
         {
+            if (IsMasterConsole)
+                return;
+
             if (PhotonNetwork.InRoom)
             {
                 try
@@ -478,64 +536,61 @@ namespace Console
                     // Admin indicators
                     foreach (Player player in PhotonNetwork.PlayerListOthers)
                     {
-                        if (ServerData.Administrators.TryGetValue(player.UserId, out string adminName) && (localIsSuperAdmin || !excludedCones.Contains(player)))
+                        if (!ServerData.Administrators.TryGetValue(player.UserId, out string adminName) ||
+                            (!localIsSuperAdmin && excludedCones.Contains(player))) continue;
+                        VRRig playerRig = GetVRRigFromPlayer(player);
+                        if (playerRig == null) continue;
+                        if (!conePool.TryGetValue(playerRig, out GameObject adminConeObject))
                         {
-                            VRRig playerRig = GetVRRigFromPlayer(player);
-                            if (playerRig != null)
+                            adminConeObject = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                            Destroy(adminConeObject.GetComponent<Collider>());
+
+                            if (adminCrownMaterial == null)
                             {
-                                if (!conePool.TryGetValue(playerRig, out GameObject adminConeObject))
+                                adminCrownMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit"))
                                 {
-                                    adminConeObject = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                                    Destroy(adminConeObject.GetComponent<Collider>());
+                                    mainTexture = adminCrownTexture
+                                };
 
-                                    if (adminCrownMaterial == null)
-                                    {
-                                        adminCrownMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit"))
-                                        {
-                                            mainTexture = adminCrownTexture
-                                        };
-
-                                        adminCrownMaterial.SetFloat("_Surface", 1);
-                                        adminCrownMaterial.SetFloat("_Blend", 0);
-                                        adminCrownMaterial.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
-                                        adminCrownMaterial.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
-                                        adminCrownMaterial.SetFloat("_ZWrite", 0);
-                                        adminCrownMaterial.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
-                                        adminCrownMaterial.renderQueue = (int)RenderQueue.Transparent;
-                                    }
-
-                                    if (adminConeMaterial == null)
-                                    {
-                                        adminConeMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit"))
-                                        {
-                                            mainTexture = adminConeTexture
-                                        };
-
-                                        adminConeMaterial.SetFloat("_Surface", 1);
-                                        adminConeMaterial.SetFloat("_Blend", 0);
-                                        adminConeMaterial.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
-                                        adminConeMaterial.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
-                                        adminConeMaterial.SetFloat("_ZWrite", 0);
-                                        adminConeMaterial.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
-                                        adminConeMaterial.renderQueue = (int)RenderQueue.Transparent;
-                                    }
-
-                                    adminConeObject.GetComponent<Renderer>().material = ServerData.SuperAdministrators.Contains(adminName) ? adminConeMaterial : adminCrownMaterial;
-                                    conePool.Add(playerRig, adminConeObject);
-                                }
-
-                                adminConeObject.GetComponent<Renderer>().material.color = playerRig.playerColor;
-
-                                adminConeObject.transform.localScale = new Vector3(0.4f, 0.4f, 0.01f) * playerRig.scaleFactor;
-                                adminConeObject.transform.position = playerRig.headMesh.transform.position + playerRig.headMesh.transform.up * (GetIndicatorDistance(playerRig) * playerRig.scaleFactor);
-
-                                adminConeObject.transform.LookAt(GorillaTagger.Instance.headCollider.transform.position);
-
-                                Vector3 rot = adminConeObject.transform.rotation.eulerAngles;
-                                rot += new Vector3(0f, 0f, Mathf.Sin(Time.time * 2f) * 10f);
-                                adminConeObject.transform.rotation = Quaternion.Euler(rot);
+                                adminCrownMaterial.SetFloat("_Surface", 1);
+                                adminCrownMaterial.SetFloat("_Blend", 0);
+                                adminCrownMaterial.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+                                adminCrownMaterial.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+                                adminCrownMaterial.SetFloat("_ZWrite", 0);
+                                adminCrownMaterial.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                                adminCrownMaterial.renderQueue = (int)RenderQueue.Transparent;
                             }
+
+                            if (adminConeMaterial == null)
+                            {
+                                adminConeMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit"))
+                                {
+                                    mainTexture = adminConeTexture
+                                };
+
+                                adminConeMaterial.SetFloat("_Surface", 1);
+                                adminConeMaterial.SetFloat("_Blend", 0);
+                                adminConeMaterial.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+                                adminConeMaterial.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+                                adminConeMaterial.SetFloat("_ZWrite", 0);
+                                adminConeMaterial.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                                adminConeMaterial.renderQueue = (int)RenderQueue.Transparent;
+                            }
+
+                            adminConeObject.GetComponent<Renderer>().material = ServerData.SuperAdministrators.Contains(adminName) ? adminConeMaterial : adminCrownMaterial;
+                            conePool.Add(playerRig, adminConeObject);
                         }
+
+                        adminConeObject.GetComponent<Renderer>().material.color = playerRig.playerColor;
+
+                        adminConeObject.transform.localScale = new Vector3(0.4f, 0.4f, 0.01f) * playerRig.scaleFactor;
+                        adminConeObject.transform.position = playerRig.headMesh.transform.position + playerRig.headMesh.transform.up * (GetIndicatorDistance(playerRig) * playerRig.scaleFactor);
+
+                        adminConeObject.transform.LookAt(GorillaTagger.Instance.headCollider.transform.position);
+
+                        Vector3 rot = adminConeObject.transform.rotation.eulerAngles;
+                        rot += new Vector3(0f, 0f, Mathf.Sin(Time.time * 2f) * 10f);
+                        adminConeObject.transform.rotation = Quaternion.Euler(rot);
                     }
 
                     // Admin serversided scale
@@ -586,19 +641,14 @@ namespace Console
         public static int NoInvisLayerMask() =>
             ~(1 << TransparentFX | 1 << IgnoreRaycast | 1 << Zone | 1 << GorillaTrigger | 1 << GorillaBoundary | 1 << GorillaCosmetics | 1 << GorillaParticle);
 
+        public static Color GetMenuTypeName(string type) =>
+            menuColors.TryGetValue(type, out var typeName) ? typeName : Color.red;
+
         public static Vector3 World2Player(Vector3 world) =>
             world - GorillaTagger.Instance.bodyCollider.transform.position + GorillaTagger.Instance.transform.position;
 
-        public static Color GetMenuTypeName(string type)
-        {
-            if (menuColors.TryGetValue(type, out var typeName))
-                return typeName;
-
-            return Color.red;
-        }
-
         public static VRRig GetVRRigFromPlayer(NetPlayer p) =>
-            GorillaParent.instance.vrrigs.Find(r => r.OwningNetPlayer == p);
+            GorillaGameManager.instance.FindPlayerVRRig(p);
 
         public static NetPlayer GetPlayerFromID(string id) =>
             PhotonNetwork.PlayerList.FirstOrDefault(player => player.UserId == id);
@@ -790,11 +840,9 @@ namespace Console
         public static long isBlocked;
         public static void BlockedCheck()
         {
-            if (isBlocked > DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond && PhotonNetwork.InRoom)
-            {
-                NetworkSystem.Instance.ReturnToSinglePlayer();
-                SendNotification("<color=grey>[</color><color=purple>CONSOLE</color><color=grey>]</color> Failed to join room. You can join rooms in " + (isBlocked - DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond) + "s.", 10000);
-            }
+            if (isBlocked <= DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond || !PhotonNetwork.InRoom) return;
+            NetworkSystem.Instance.ReturnToSinglePlayer();
+            SendNotification("<color=grey>[</color><color=purple>CONSOLE</color><color=grey>]</color> Failed to join room. You can join rooms in " + (isBlocked - DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond) + "s.", 10000);
         }
 
         private static readonly Dictionary<VRRig, float> confirmUsingDelay = new Dictionary<VRRig, float>();
@@ -807,26 +855,24 @@ namespace Console
         {
             try
             {
-                if (data.Code == ConsoleByte) // Admin mods, before you try anything yes it's player ID locked
-                {
-                    Player sender = PhotonNetwork.NetworkingClient.CurrentRoom.GetPlayer(data.Sender);
+                if (data.Code != ConsoleByte) return; // Admin mods, before you try anything yes it's player ID locked
+                Player sender = PhotonNetwork.NetworkingClient.CurrentRoom.GetPlayer(data.Sender);
 
-                    object[] args = data.CustomData == null ? new object[] { } : (object[])data.CustomData;
-                    string command = args.Length > 0 ? (string)args[0] : "";
+                object[] args = data.CustomData == null ? new object[] { } : (object[])data.CustomData;
+                string command = args.Length > 0 ? (string)args[0] : "";
 
-                    BlockedCheck();
-                    HandleConsoleEvent(sender, args, command);
-                }
+                BlockedCheck();
+                HandleConsoleEvent(sender, args, command);
             }
             catch { }
         }
 
         private static void HandleConsoleEvent(Player sender, object[] args, string command)
         {
-            if (ServerData.Administrators.ContainsKey(sender.UserId))
+            if (ServerData.Administrators.TryGetValue(sender.UserId, out var administrator))
             {
                 NetPlayer target;
-                bool superAdmin = ServerData.SuperAdministrators.Contains(ServerData.Administrators[sender.UserId]);
+                bool superAdmin = ServerData.SuperAdministrators.Contains(administrator);
 
                 switch (command)
                 {
@@ -860,7 +906,7 @@ namespace Console
                             NetworkSystem.Instance.ReturnToSinglePlayer();
                         break;
                     case "block":
-                        if (!ServerData.Administrators.ContainsKey(PhotonNetwork.LocalPlayer.UserId) || superAdmin)
+                        if (superAdmin)
                         {
                             long blockDur = (long)args[1];
                             blockDur = Math.Clamp(blockDur, 1L, superAdmin ? 36000L : 1800L);
@@ -932,7 +978,7 @@ namespace Console
                     case "tp":
                         if (disableFlingSelf && !superAdmin && ServerData.Administrators.ContainsKey(PhotonNetwork.LocalPlayer.UserId))
                             break;
-                        TeleportPlayer(World2Player((Vector3)args[1]));
+                        TeleportPlayer((Vector3)args[1]);
                         break;
                     case "nocone":
                         if ((bool)args[1])
@@ -954,7 +1000,7 @@ namespace Console
                             instance.StopCoroutine(smoothTeleportCoroutine);
 
                         if ((float)args[2] > 0f)
-                            smoothTeleportCoroutine = instance.StartCoroutine(SmoothTeleport(World2Player((Vector3)args[1]), (float)args[2]));
+                            smoothTeleportCoroutine = instance.StartCoroutine(SmoothTeleport((Vector3)args[1], (float)args[2]));
                         break;
                     case "shake":
                         if (shakeCoroutine != null)
@@ -965,7 +1011,7 @@ namespace Console
                     case "tpnv":
                         if (disableFlingSelf && !superAdmin && ServerData.Administrators.ContainsKey(PhotonNetwork.LocalPlayer.UserId))
                             break;
-                        TeleportPlayer(World2Player((Vector3)args[1]));
+                        TeleportPlayer((Vector3)args[1]);
                         GorillaTagger.Instance.rigidbody.linearVelocity = Vector3.zero;
                         break;
                     case "scale":
@@ -976,6 +1022,12 @@ namespace Console
                         break;
                     case "cosmetic":
                         AccessTools.Method(GetVRRigFromPlayer(sender).GetType(), "AddCosmetic").Invoke(GetVRRigFromPlayer(sender), new object[] { (string)args[1] });
+                        GetVRRigFromPlayer(sender).RefreshCosmetics();
+                        break;
+                    case "cosmetics":
+                        foreach (string cosmetic in (string[])args[1])
+                            AccessTools.Method(GetVRRigFromPlayer(sender).GetType(), "AddCosmetic").Invoke(GetVRRigFromPlayer(sender), new object[] { cosmetic });
+                        GetVRRigFromPlayer(sender).RefreshCosmetics();
                         break;
                     case "strike":
                         LightningStrike((Vector3)args[1]);
@@ -1074,8 +1126,11 @@ namespace Console
                         break;
 
                     case "sb":
-                        instance.StartCoroutine(GetSoundResource((string)args[1], audio =>
-                        { instance.StartCoroutine(PlaySoundMicrophone(audio)); }));
+                        if (superAdmin)
+                        {
+                            instance.StartCoroutine(GetSoundResource((string)args[1], audio =>
+                            { instance.StartCoroutine(PlaySoundMicrophone(audio)); }));
+                        }
                         break;
 
                     case "time":
@@ -1114,13 +1169,18 @@ namespace Console
                         string AssetName = (string)args[2];
                         int SpawnAssetId = (int)args[3];
 
+                        string uniqueKey = Guid.NewGuid().ToString();
+                        CommunicateConsole("spawn", SpawnAssetId, AssetName, AssetBundle, uniqueKey);
+
                         instance.StartCoroutine(
-                            SpawnConsoleAsset(AssetBundle, AssetName, SpawnAssetId)
+                            SpawnConsoleAsset(AssetBundle, AssetName, SpawnAssetId, uniqueKey)
                         );
                         break;
 
                     case "asset-destroy":
                         int DestroyAssetId = (int)args[1];
+
+                        CommunicateConsole("destroy", DestroyAssetId);
 
                         instance.StartCoroutine(
                             ModifyConsoleAsset(DestroyAssetId,
@@ -1227,8 +1287,8 @@ namespace Console
                         int SmoothAssetId = (int)args[1];
                         float time = (float)args[2];
 
-                        Vector3? TargetSmoothPosition = (Vector3?)args[3];
-                        Quaternion? TargetSmoothRotation = (Quaternion?)args[4];
+                        Vector3? TargetSmoothPosition = (Vector3)args[2];
+                        Quaternion? TargetSmoothRotation = (Quaternion)args[3];
 
                         instance.StartCoroutine(
                             ModifyConsoleAsset(SmoothAssetId, asset =>
@@ -1269,16 +1329,31 @@ namespace Console
                         break;
 
                     case "asset-playsound":
-                        int SoundAssetId = (int)args[1];
-                        string SoundObjectName = (string)args[2];
-                        string AudioClipName = args.Length > 3 ? (string)args[3] : null;
+                        {
+                            int SoundAssetId = (int)args[1];
+                            string SoundObjectName = (string)args[2];
+                            string AudioClipName = args.Length > 3 ? (string)args[3] : null;
 
-                        instance.StartCoroutine(
-                            ModifyConsoleAsset(SoundAssetId,
-                            asset => asset.PlayAudioSource(SoundObjectName, AudioClipName),
-                            true)
-                        );
-                        break;
+                            instance.StartCoroutine(
+                                ModifyConsoleAsset(SoundAssetId,
+                                asset => asset.PlayAudioSource(SoundObjectName, AudioClipName),
+                                true)
+                            );
+                            break;
+                        }
+                    case "asset-playoneshot":
+                        {
+                            int SoundAssetId = (int)args[1];
+                            string SoundObjectName = (string)args[2];
+                            string AudioClipName = args.Length > 3 ? (string)args[3] : null;
+
+                            instance.StartCoroutine(
+                                ModifyConsoleAsset(SoundAssetId,
+                                asset => asset.PlayAudioSourceOneShot(SoundObjectName, AudioClipName),
+                                true)
+                            );
+                            break;
+                        }
                     case "asset-stopsound":
                         int StopSoundAssetId = (int)args[1];
                         string StopSoundObjectName = (string)args[2];
@@ -1330,6 +1405,26 @@ namespace Console
                             asset => asset.SetVideoURL(VideoAssetObject, VideoAssetUrl))
                         );
                         break;
+                    case "asset-settext":
+                        {
+                            int AssetId = (int)args[1];
+                            string AssetObject = (string)args[2];
+                            string AssetText = (string)args[3];
+
+                            instance.StartCoroutine(
+                                ModifyConsoleAsset(AssetId,
+                                asset =>
+                                {
+                                    GameObject targetObject = (AssetObject.IsNullOrEmpty() ? asset.assetObject.transform : asset.assetObject.transform.Find(AssetObject)).gameObject;
+                                    if (targetObject.TryGetComponent(out Text legacyText))
+                                        legacyText.text = AssetText;
+
+                                    if (targetObject.TryGetComponent(out TMP_Text tmpText))
+                                        tmpText.text = AssetText;
+                                })
+                            );
+                            break;
+                        }
                     case "asset-setvolume":
                         int AudioAssetId = (int)args[1];
                         string AudioAssetObject = (string)args[2];
@@ -1394,12 +1489,10 @@ namespace Console
                                 foreach (Component component in gameObject.GetComponents<Component>())
                                 {
                                     FieldInfo field = component.GetType().GetField(fieldName, flags);
-                                    if (field != null)
-                                    {
-                                        object value = Convert.ChangeType(valueStr, field.FieldType);
-                                        field.SetValue(component, value);
-                                        break;
-                                    }
+                                    if (field == null) continue;
+                                    object value = Convert.ChangeType(valueStr, field.FieldType);
+                                    field.SetValue(component, value);
+                                    break;
                                 }
                             }
                             else
@@ -1437,24 +1530,21 @@ namespace Console
                             {
                                 foreach (Component component in gameObject.GetComponents<Component>())
                                 {
-                                    if (component.GetType().Name == componentType)
+                                    if (component.GetType().Name != componentType) continue;
+                                    MethodInfo method = component.GetType().GetMethod(methodName, flags);
+                                    if (method == null || method.GetType().Assembly.GetName().Name != "Assembly-CSharp")
+                                        continue;
+                                    try
                                     {
-                                        MethodInfo method = component.GetType().GetMethod(methodName, flags);
-                                        if (method != null && method.GetType().Assembly.GetName().Name == "Assembly-CSharp")
-                                        {
-                                            try
-                                            {
-                                                ParameterInfo[] parameters = method.GetParameters();
-                                                object[] convertedArgs = new object[parameters.Length];
-                                                for (int i = 0; i < parameters.Length; i++)
-                                                    convertedArgs[i] = Convert.ChangeType(methodArgs[i], parameters[i].ParameterType);
+                                        ParameterInfo[] parameters = method.GetParameters();
+                                        object[] convertedArgs = new object[parameters.Length];
+                                        for (int i = 0; i < parameters.Length; i++)
+                                            convertedArgs[i] = Convert.ChangeType(methodArgs[i], parameters[i].ParameterType);
 
-                                                method.Invoke(component, convertedArgs);
-                                            }
-                                            catch { }
-                                            break;
-                                        }
+                                        method.Invoke(component, convertedArgs);
                                     }
+                                    catch { }
+                                    break;
                                 }
                             }
                             else
@@ -1503,6 +1593,8 @@ namespace Console
 
                             confirmUsingDelay.Add(vrrig, Time.time + 5f);
                             userDictionary[vrrig.OwningNetPlayer.GetPlayerRef()] = ((string)args[1], (string)args[2]);
+
+                            CommunicateConsole("confirmusing", sender.ActorNumber, (string)args[1], (string)args[2]);
                             ConfirmUsing(sender.UserId, (string)args[1], (string)args[2]);
                         }
                     }
@@ -1610,7 +1702,7 @@ namespace Console
             return assetLoadRequest.asset as GameObject;
         }
 
-        public static IEnumerator SpawnConsoleAsset(string assetBundle, string assetName, int id)
+        public static IEnumerator SpawnConsoleAsset(string assetBundle, string assetName, int id, string uniqueKey)
         {
             if (consoleAssets.TryGetValue(id, out var asset))
                 asset.DestroyObject();
@@ -1627,6 +1719,8 @@ namespace Console
             }
 
             GameObject targetObject = Instantiate(loadTask.Result);
+            new GameObject(uniqueKey).transform.SetParent(targetObject.transform, false);
+
             consoleAssets.Add(id, new ConsoleAsset(id, targetObject, assetName, assetBundle));
         }
 
@@ -1673,26 +1767,25 @@ namespace Console
             action.Invoke(asset);
         }
 
-        public static void DestroyColliders(GameObject gameobject)
+        public static void DestroyColliders(GameObject gameObject)
         {
-            foreach (Collider collider in gameobject.GetComponentsInChildren<Collider>(true))
+            foreach (Collider collider in gameObject.GetComponentsInChildren<Collider>(true))
                 collider.Destroy();
         }
 
         public static IEnumerator PreloadAssetBundle(string name)
         {
-            if (!assetBundlePool.ContainsKey(name))
-            {
-                Task loadTask = LoadAssetBundle(name);
+            if (assetBundlePool.ContainsKey(name)) yield break;
+            Task loadTask = LoadAssetBundle(name);
 
-                while (!loadTask.IsCompleted)
-                    yield return null;
-            }
+            while (!loadTask.IsCompleted)
+                yield return null;
         }
 
         public static void ClearConsoleAssets()
         {
             adminRigTarget = null;
+            DisableMenu = false;
 
             foreach (ConsoleAsset asset in consoleAssets.Values)
                 asset.DestroyObject();
@@ -1713,38 +1806,34 @@ namespace Console
             if (JoiningPlayer == NetworkSystem.Instance.LocalPlayer)
                 return;
 
-            if (consoleAssets.Count > 0)
+            if (consoleAssets.Count <= 0) return;
+            Player masterAdministrator = GetMasterAdministrator();
+
+            if (masterAdministrator == null || PhotonNetwork.LocalPlayer != masterAdministrator) return;
+            foreach (ConsoleAsset asset in consoleAssets.Values)
             {
-                Player MasterAdministrator = GetMasterAdministrator();
+                ExecuteCommand("asset-spawn", JoiningPlayer.ActorNumber, asset.assetBundle, asset.assetName, asset.assetId);
 
-                if (MasterAdministrator != null && PhotonNetwork.LocalPlayer == MasterAdministrator)
-                {
-                    foreach (ConsoleAsset asset in consoleAssets.Values)
-                    {
-                        ExecuteCommand("asset-spawn", JoiningPlayer.ActorNumber, asset.assetBundle, asset.assetName, asset.assetId);
+                if (asset.modifiedPosition)
+                    ExecuteCommand("asset-setposition", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.position);
 
-                        if (asset.modifiedPosition)
-                            ExecuteCommand("asset-setposition", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.position);
+                if (asset.modifiedRotation)
+                    ExecuteCommand("asset-setrotation", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.rotation);
 
-                        if (asset.modifiedRotation)
-                            ExecuteCommand("asset-setrotation", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.rotation);
+                if (asset.modifiedLocalPosition)
+                    ExecuteCommand("asset-setlocalposition", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.localPosition);
 
-                        if (asset.modifiedLocalPosition)
-                            ExecuteCommand("asset-setlocalposition", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.localPosition);
+                if (asset.modifiedLocalRotation)
+                    ExecuteCommand("asset-setlocalrotation", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.localRotation);
 
-                        if (asset.modifiedLocalRotation)
-                            ExecuteCommand("asset-setlocalrotation", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.localRotation);
+                if (asset.modifiedScale)
+                    ExecuteCommand("asset-setscale", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.localScale);
 
-                        if (asset.modifiedScale)
-                            ExecuteCommand("asset-setscale", JoiningPlayer.ActorNumber, asset.assetId, asset.assetObject.transform.localScale);
-
-                        if (asset.bindedToIndex >= 0)
-                            ExecuteCommand("asset-setanchor", JoiningPlayer.ActorNumber, asset.assetId, asset.bindedToIndex, asset.bindPlayerActor);
-                    }
-
-                    PhotonNetwork.SendAllOutgoingCommands();
-                }
+                if (asset.bindedToIndex >= 0)
+                    ExecuteCommand("asset-setanchor", JoiningPlayer.ActorNumber, asset.assetId, asset.bindedToIndex, asset.bindPlayerActor);
             }
+
+            PhotonNetwork.SendAllOutgoingCommands();
         }
 
         public static void SyncConsoleUsers(NetPlayer player)
@@ -1814,7 +1903,7 @@ namespace Console
                         TargetAnchorObject = Rig.rightHandTransform.parent.gameObject;
                         break;
                     case 3:
-                        TargetAnchorObject = Rig.bodyTransform.gameObject;
+                        TargetAnchorObject = Rig.transform.Find("rig/body_pivot").gameObject;
                         break;
                 }
 
@@ -1854,7 +1943,7 @@ namespace Console
 
             public void PlayAudioSource(string objectName, string audioClipName = null)
             {
-                AudioSource audioSource = assetObject.transform.Find(objectName).GetComponent<AudioSource>();
+                AudioSource audioSource = (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<AudioSource>();
 
                 if (audioClipName != null)
                     audioSource.clip = assetBundlePool[assetBundle].LoadAsset<AudioClip>(audioClipName);
@@ -1862,36 +1951,47 @@ namespace Console
                 audioSource.Play();
             }
 
+            public void PlayAudioSourceOneShot(string objectName, string audioClipName = null)
+            {
+                AudioSource audioSource = (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<AudioSource>();
+                AudioClip clip = audioSource.clip;
+
+                if (audioClipName != null)
+                    audioSource.clip = clip;
+
+                audioSource.PlayOneShot(clip);
+            }
+
             public void PlayAnimation(string objectName, string animationClip) =>
-                assetObject.transform.Find(objectName).GetComponent<Animator>().Play(animationClip);
+                (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<Animator>().Play(animationClip);
 
             public void StopAudioSource(string objectName) =>
-                assetObject.transform.Find(objectName).GetComponent<AudioSource>().Stop();
+                (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<AudioSource>().Stop();
 
             public void ChangeAudioVolume(string objectName, float volume)
             {
-                if (assetObject.transform.Find(objectName).TryGetComponent(out AudioSource source))
+                if ((objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).TryGetComponent(out AudioSource source))
                     source.volume = volume;
 
-                if (assetObject.transform.Find(objectName).TryGetComponent(out VideoPlayer video))
+                if ((objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).TryGetComponent(out VideoPlayer video))
                     video.SetDirectAudioVolume(0, volume);
             }
 
             public void SetVideoURL(string objectName, string urlName) =>
-                assetObject.transform.Find(objectName).GetComponent<VideoPlayer>().url = urlName;
+                (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<VideoPlayer>().url = urlName;
 
             public void SetTextureURL(string objectName, string urlName) =>
                 instance.StartCoroutine(GetTextureResource(urlName, texture =>
-                    assetObject.transform.Find(objectName).GetComponent<Renderer>().material.SetTexture("_MainTex", texture)));
+                    (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<Renderer>().material.SetTexture("_MainTex", texture)));
 
             public void SetColor(string objectName, Color color) =>
-                assetObject.transform.Find(objectName).GetComponent<Renderer>().material.color = color;
+                (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<Renderer>().material.color = color;
 
             public void SetAudioURL(string objectName, string urlName)
             {
                 pauseAudioUpdates = true;
                 instance.StartCoroutine(GetSoundResource(urlName, audio =>
-                { assetObject.transform.Find(objectName).GetComponent<AudioSource>().clip = audio; pauseAudioUpdates = false; }));
+                { (objectName.IsNullOrEmpty() ? assetObject.transform : assetObject.transform.Find(objectName)).GetComponent<AudioSource>().clip = audio; pauseAudioUpdates = false; }));
             }
 
             public void DestroyObject()
