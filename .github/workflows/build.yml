@@ -1,0 +1,18 @@
+name: Build Mod
+on: [push]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with: { dotnet-version: '4.7.2' } # Adjust for Unity
+      - name: Install Dependencies
+        run: | # Add commands to fetch BepInEx, Unity refs (use nuget or downloads)
+      - name: Build
+        run: dotnet build # Or use MakeRelease.ps1 if in template
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with: { name: ModDLL, path: bin/Release/*.dll }
+      
